@@ -1,18 +1,22 @@
 # encoding: UTF-8
 # 系统模块
+import functools
 import inspect
+import logging
 from collections.abc import Generator
-from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from queue import Queue
 from threading import *
-import functools
+
+logger = logging.getLogger('biliup')
 
 
 class EventManager(Thread):
-    def __init__(self, context=None, pool1_size=3, pool2_size=3):
+    def __init__(self, context=None, pool=None):
         """初始化事件管理器"""
         super().__init__(name='Synchronous', daemon=True)
+        if pool is None:
+            pool = {}
         if context is None:
             context = {}
         self.context = context
@@ -20,11 +24,8 @@ class EventManager(Thread):
         self.__eventQueue = Queue()
         # 事件管理器开关
         self.__active = True
-        # 事件处理线程池1
-        self._pool = {
-            'Asynchronous1': ThreadPoolExecutor(pool1_size, thread_name_prefix='Asynchronous1'),
-            'Asynchronous2': ThreadPoolExecutor(pool2_size, thread_name_prefix='Asynchronous2')
-        }
+        # 事件处理线程池
+        self._pool = pool
         # 阻塞函数列表
         self.__block = []
 
@@ -71,7 +72,14 @@ class EventManager(Thread):
         self.__handlers[type_] = handlerlist
         # 若要注册的处理器不在该事件的处理器列表中，则注册该事件
         if handler not in handlerlist:
-            handlerlist.append(handler)
+            @functools.wraps(handler)
+            def try_handler(event):
+                try:
+                    handler(event)
+                except:
+                    logger.exception('try_handler')
+
+            handlerlist.append(try_handler)
 
     def remove_event_listener(self, type_, handler):
         """移除监听器的处理函数"""
@@ -119,8 +127,8 @@ class EventManager(Thread):
                     callback(_event)
                     return _event
 
-                self.add_event_listener(type_, wrapper)
                 wrapper.pool = block
+                self.add_event_listener(type_, wrapper)
                 return wrapper
         else:
             def decorator(func):
@@ -161,4 +169,4 @@ class Event:
     """事件对象"""
     type_: str  # 事件类型
     args: tuple = ()
-    dict: dict = field(default_factory=dict)  # 字典用于保存具体的事件数据
+    dict: dict = field(default_factory=dict)  # type: ignore # 字典用于保存具体的事件数据

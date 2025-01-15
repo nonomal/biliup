@@ -4,13 +4,14 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field, InitVar
 from json import JSONDecodeError
 from os.path import splitext, basename
-from typing import Union, Any
+from typing import Union, Any, List
 from urllib import parse
 from urllib.parse import quote
 
@@ -29,11 +30,13 @@ from ..engine.upload import UploadBase, logger
 class BiliWeb(UploadBase):
     def __init__(
             self, principal, data, user, submit_api=None, copyright=2, postprocessor=None, dtime=None,
-            dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description=''
+            dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='', credits=[]
     ):
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         if tags is None:
             tags = []
+        else:
+            tags = [str(tag).format(streamer=self.data['name']) for tag in tags]
         self.user = user
         self.lines = lines
         self.submit_api = submit_api
@@ -42,11 +45,12 @@ class BiliWeb(UploadBase):
         self.tags = tags
         self.cover_path = cover_path
         self.desc = description
+        self.credits = credits
         self.dynamic = dynamic
         self.copyright = copyright
         self.dtime = dtime
 
-    def upload(self, file_list):
+    def upload(self, file_list: List[UploadBase.FileInfo]) -> List[UploadBase.FileInfo]:
         video = Data()
         video.dynamic = self.dynamic
         with BiliBili(video) as bili:
@@ -54,10 +58,18 @@ class BiliWeb(UploadBase):
             bili.appsec = self.user.get('appsec')
             bili.login(self.persistence_path, self.user)
             for file in file_list:
-                video_part = bili.upload_file(file, self.lines, self.threads)  # 上传视频
+                video_part = bili.upload_file(file.video, self.lines, self.threads)  # 上传视频
                 video_part['title'] = video_part['title'][:80]
                 video.append(video_part)  # 添加已经上传的视频
             video.title = self.data["format_title"][:80]  # 稿件标题限制80字
+            if self.credits:
+                video.desc_v2 = self.creditsToDesc_v2()
+            else:
+                video.desc_v2=[{
+                    "raw_text": self.desc,
+                    "biz_id": "",
+                    "type": 1
+                }]
             video.desc = self.desc
             video.copyright = self.copyright
             if self.copyright == 2:
@@ -73,6 +85,34 @@ class BiliWeb(UploadBase):
         logger.info(f"上传成功: {ret}")
         return file_list
 
+    def creditsToDesc_v2(self):
+            desc_v2 = []
+            desc_v2_tmp = self.desc
+            for credit in self.credits:
+                try :
+                    num = desc_v2_tmp.index("@credit")
+                    desc_v2.append({
+                        "raw_text": " "+desc_v2_tmp[:num],
+                        "biz_id": "",
+                        "type": 1
+                    })
+                    desc_v2.append({
+                        "raw_text": credit["username"],
+                        "biz_id": str(credit["uid"]),
+                        "type": 2
+                    })
+                    self.desc = self.desc.replace(
+                        "@credit", "@"+credit["username"]+"  ", 1)
+                    desc_v2_tmp = desc_v2_tmp[num+7:]
+                except IndexError:
+                    logger.error('简介中的@credit占位符少于credits的数量,替换失败')
+            desc_v2.append({
+                "raw_text": " "+desc_v2_tmp,
+                "biz_id": "",
+                "type": 1
+            })
+            desc_v2[0]["raw_text"] = desc_v2[0]["raw_text"][1:]  # 开头空格会导致识别简介过长
+            return desc_v2
 
 class BiliBili:
     def __init__(self, video: 'Data'):
@@ -83,10 +123,11 @@ class BiliBili:
             self.appsec = 'c75875c596a69eb55bd119e74b07cfe3'
         self.__session = requests.Session()
         self.video = video
-        self.__session.mount('https://', HTTPAdapter(max_retries=Retry(total=5, method_whitelist=False)))
+        self.__session.mount('https://', HTTPAdapter(max_retries=Retry(total=5)))
         self.__session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/63.0.3239.108",
-            "Referer": "https://www.bilibili.com/", 'Connection': 'keep-alive'
+            'user-agent': "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/63.0.3239.108",
+            'referer': "https://www.bilibili.com/",
+            'connection': 'keep-alive'
         })
         self.cookies = None
         self.access_token = None
@@ -140,16 +181,21 @@ class BiliBili:
         response = self.__session.get("https://member.bilibili.com/x/vupre/web/archive/pre")
         return response.json()
 
+    def myinfo(self, cookies):
+        requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookies)
+        response = self.__session.get('http://api.bilibili.com/x/space/myinfo')
+        return response.json()
+
     def login(self, persistence_path, user):
         self.persistence_path = persistence_path
         if os.path.isfile(persistence_path):
             print('使用持久化内容上传')
             self.load()
-        if not self.cookies and user.get('cookies'):
+        if user.get('cookies'):
             self.cookies = user['cookies']
-        if not self.access_token and user.get('access_token'):
+        if user.get('access_token'):
             self.access_token = user['access_token']
-        if not self.account and user.get('account'):
+        if user.get('account'):
             self.account = user['account']
         if self.cookies:
             try:
@@ -293,41 +339,52 @@ class BiliBili:
     def upload_file(self, filepath: str, lines='AUTO', tasks=3):
         """上传本地视频文件,返回视频信息dict
         b站目前支持4种上传线路upos, kodo, gcs, bos
-        gcs: {"os":"gcs","query":"bucket=bvcupcdngcsus&probe_version=20200810",
+        gcs: {"os":"gcs","query":"bucket=bvcupcdngcsus&probe_version=20221109",
         "probe_url":"//storage.googleapis.com/bvcupcdngcsus/OK"},
-        bos: {"os":"bos","query":"bucket=bvcupcdnboshb&probe_version=20200810",
+        bos: {"os":"bos","query":"bucket=bvcupcdnboshb&probe_version=20221109",
         "probe_url":"??"}
         """
+        preferred_upos_cdn = None
         if not self._auto_os:
-            if lines == 'kodo':
-                self._auto_os = {"os": "kodo", "query": "bucket=bvcupcdnkodobm&probe_version=20200810",
-                                 "probe_url": "//up-na0.qbox.me/crossdomain.xml"}
-            elif lines == 'bda2':
-                self._auto_os = {"os": "upos", "query": "upcdn=bda2&probe_version=20200810",
-                                 "probe_url": "//upos-sz-upcdnbda2.bilivideo.com/OK"}
+            if lines == 'bda':
+                self._auto_os = {"os": "upos", "query": "upcdn=bda&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnbda.bilivideo.com/OK"}
+                preferred_upos_cdn = 'bda'
+            elif lines in {'bda2', 'cs-bda2'}:
+                self._auto_os = {"os": "upos", "query": "upcdn=bda2&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnbda2.bilivideo.com/OK"}
+                preferred_upos_cdn = 'bda2'
             elif lines == 'ws':
-                self._auto_os = {"os": "upos", "query": "upcdn=ws&probe_version=20200810",
-                                 "probe_url": "//upos-sz-upcdnws.bilivideo.com/OK"}
-            elif lines == 'qn':
-                self._auto_os = {"os": "upos", "query": "upcdn=qn&probe_version=20200810",
-                                 "probe_url": "//upos-sz-upcdnqn.bilivideo.com/OK"}
-            elif lines == 'cos':
-                self._auto_os = {"os": "cos", "query": "",
-                                 "probe_url": ""}
-            elif lines == 'cos-internal':
-                self._auto_os = {"os": "cos-internal", "query": "",
-                                 "probe_url": ""}
+                self._auto_os = {"os": "upos", "query": "upcdn=ws&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnws.bilivideo.com/OK"}
+                preferred_upos_cdn = 'ws'
+            elif lines in {'qn', 'cs-qn'}:
+                self._auto_os = {"os": "upos", "query": "upcdn=qn&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnqn.bilivideo.com/OK"}
+                preferred_upos_cdn = 'qn'
+            elif lines == 'bldsa':
+                self._auto_os = {"os": "upos", "query": "upcdn=bldsa&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnbldsa.bilivideo.com/OK"}
+                preferred_upos_cdn = 'bldsa'
+            elif lines == 'tx':
+                self._auto_os = {"os": "upos", "query": "upcdn=tx&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdntx.bilivideo.com/OK"}
+                preferred_upos_cdn = 'tx'
+            elif lines == 'txa':
+                self._auto_os = {"os": "upos", "query": "upcdn=txa&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdntxa.bilivideo.com/OK"}
+                preferred_upos_cdn = 'txa'
             else:
                 self._auto_os = self.probe()
             logger.info(f"线路选择 => {self._auto_os['os']}: {self._auto_os['query']}. time: {self._auto_os.get('cost')}")
         if self._auto_os['os'] == 'upos':
             upload = self.upos
-        elif self._auto_os['os'] == 'cos':
-            upload = self.cos
-        elif self._auto_os['os'] == 'cos-internal':
-            upload = lambda *args, **kwargs: self.cos(*args, **kwargs, internal=True)
-        elif self._auto_os['os'] == 'kodo':
-            upload = self.kodo
+        # elif self._auto_os['os'] == 'cos':
+        #     upload = self.cos
+        # elif self._auto_os['os'] == 'cos-internal':
+        #     upload = lambda *args, **kwargs: self.cos(*args, **kwargs, internal=True)
+        # elif self._auto_os['os'] == 'kodo':
+        #     upload = self.kodo
         else:
             logger.error(f"NoSearch:{self._auto_os['os']}")
             raise NotImplementedError(self._auto_os['os'])
@@ -343,10 +400,24 @@ class BiliBili:
                 'name': f.name,
                 'size': total_size,
             }
-            ret = self.__session.get(
+            resp = self.__session.get(
                 f"https://member.bilibili.com/preupload?{self._auto_os['query']}", params=query,
                 timeout=5)
-            return asyncio.run(upload(f, total_size, ret.json(), tasks=tasks))
+            ret = resp.json()
+            logger.debug(f"preupload: {ret}")
+            if preferred_upos_cdn:
+                original_endpoint: str = ret['endpoint']
+                if re.match(r'//upos-(sz|cs)-upcdn(bda2|ws|qn)\.bilivideo\.com', original_endpoint):
+                    if re.match(r'bda2|qn|ws', preferred_upos_cdn):
+                        logger.debug(f"Preferred UpOS CDN: {preferred_upos_cdn}")
+                        new_endpoint = re.sub(r'upcdn(bda2|qn|ws)', f'upcdn{preferred_upos_cdn}', original_endpoint)
+                        logger.debug(f"{original_endpoint} => {new_endpoint}")
+                        ret['endpoint'] = new_endpoint
+                    else:
+                        logger.error(f"Unrecognized preferred_upos_cdn: {preferred_upos_cdn}")
+                else:
+                    logger.warning(f"Assigned UpOS endpoint {original_endpoint} was never seen before, something else might have changed, so will not modify it")
+            return asyncio.run(upload(f, total_size, ret, tasks=tasks))
 
     async def cos(self, file, total_size, ret, chunk_size=10485760, tasks=3, internal=False):
         filename = file.name
@@ -472,7 +543,7 @@ class BiliBili:
             "X-Upos-Auth": auth
         }
         # 向上传地址申请上传，得到上传id等信息
-        upload_id = self.__session.post(f'{url}?uploads&output=json', timeout=5,
+        upload_id = self.__session.post(f'{url}?uploads&output=json', timeout=15,
                                         headers=headers).json()["upload_id"]
         # 开始上传
         parts = []  # 分块信息
@@ -500,8 +571,8 @@ class BiliBili:
             'output': 'json',
             'profile': 'ugcupos/bup'
         }
-        ii = 0
-        while ii <= 3:
+        attempt = 0
+        while attempt <= 5:  # 一旦放弃就会丢失前面所有的进度，多试几次吧
             try:
                 r = self.__session.post(url, params=p, json={"parts": parts}, headers=headers, timeout=15).json()
                 if r.get('OK') == 1:
@@ -509,8 +580,8 @@ class BiliBili:
                     return {"title": splitext(filename)[0], "filename": splitext(basename(upos_uri))[0], "desc": ""}
                 raise IOError(r)
             except IOError:
-                ii += 1
-                logger.info("上传出现问题，尝试重连，次数：" + str(ii))
+                attempt += 1
+                logger.info(f"请求合并分片时出现问题，尝试重连，次数：" + str(attempt))
                 time.sleep(15)
 
     @staticmethod
@@ -541,8 +612,6 @@ class BiliBili:
     def submit(self, submit_api=None):
         if not self.video.title:
             self.video.title = self.video.videos[0]["title"]
-        for v in self.video.videos:
-            v["title"] = ""
         self.__session.get('https://member.bilibili.com/x/geetest/pre/add', timeout=5)
 
         if submit_api is None:

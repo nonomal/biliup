@@ -1,7 +1,8 @@
 import logging
+import platform
 import sys
 
-__version__ = "0.3.5"
+__version__ = "0.4.81"
 
 LOG_CONF = {
     'version': 1,
@@ -12,7 +13,7 @@ LOG_CONF = {
             # 'datefmt': "%Y-%m-%d %H:%M:%S"
         },
         'simple': {
-            'format': '%(filename)s%(lineno)d[%(levelname)s]Tname:%(threadName)s %(message)s'
+            'format': '%(asctime)s %(filename)s%(lineno)d[%(levelname)s]Tname:%(threadName)s %(message)s'
         },
     },
     'handlers': {
@@ -29,7 +30,8 @@ LOG_CONF = {
             'interval': 1,
             'backupCount': 1,
             'filename': 'ds_update.log',
-            'formatter': 'verbose'
+            'formatter': 'verbose',
+            'encoding': 'utf-8'
         }
     },
     'root': {
@@ -43,3 +45,17 @@ LOG_CONF = {
         },
     }
 }
+
+if (3, 10, 6) > sys.version_info >= (3, 8) and platform.system() == 'Windows':
+    # fix 'Event loop is closed' RuntimeError in Windows
+    from asyncio import proactor_events
+    from biliup.common.tools import silence_event_loop_closed
+
+    proactor_events._ProactorBasePipeTransport.__del__ = silence_event_loop_closed(
+        proactor_events._ProactorBasePipeTransport.__del__)
+
+
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    import multiprocessing
+    multiprocessing.freeze_support()
+    print('running in a PyInstaller bundle')

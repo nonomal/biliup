@@ -23,23 +23,27 @@ class Plugin:
     @staticmethod
     def download(regexp):
         def decorator(cls):
-            @functools.wraps(cls)
-            def wrapper(*args, **kw):
-                return cls(*args, **kw)
-            wrapper.VALID_URL_BASE = regexp
-            Plugin.download_plugins.append(wrapper)
-            return wrapper
+            cls.VALID_URL_BASE = regexp
+            Plugin.download_plugins.append(cls)
+            return cls
         return decorator
 
     @staticmethod
     def upload(platform):
         def decorator(cls):
-            Plugin.upload_plugins[platform] = cls
-            return cls
+            @functools.wraps(cls)
+            def wrapper(*args, **kw):
+                print(f"args {args}")
+                print(f"kw {kw}")
+                return cls(*args, **kw)
+            Plugin.upload_plugins[platform] = wrapper
+            return wrapper
         return decorator
 
     @classmethod
     def sorted_checker(cls, urls):
+        if not urls:
+            return {}
         from ..plugins import general
         curls = urls.copy()
         checker_plugins = {}
@@ -47,8 +51,6 @@ class Plugin:
             url_list = suit_url(plugin.VALID_URL_BASE, curls)
             if not url_list:
                 continue
-            elif hasattr(plugin, "BatchCheck"):
-                checker_plugins[plugin.__name__] = plugin.BatchCheck(url_list)
             else:
                 plugin.url_list = url_list
                 checker_plugins[plugin.__name__] = plugin
@@ -57,6 +59,16 @@ class Plugin:
         general.__plugin__.url_list = curls
         checker_plugins[general.__plugin__.__name__] = general.__plugin__
         return checker_plugins
+
+    @classmethod
+    def inspect_checker(cls, url):
+        from ..plugins import general
+        for plugin in cls.download_plugins:
+            if not re.match(plugin.VALID_URL_BASE, url):
+                continue
+            else:
+                return plugin
+        return general.__plugin__
 
     def load_plugins(self, pkg):
         """Attempt to load plugins from the path specified.
